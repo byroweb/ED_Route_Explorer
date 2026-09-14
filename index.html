@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Elite Dangerous Route Explorer</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="scene"></div>
+
+    <!-- Control panel -->
+    <div id="panel">
+      <h1>Route Explorer</h1>
+      <div class="sub">Elite Dangerous &middot; EDSM-powered 3D corridor mapper</div>
+
+      <div class="field">
+        <label for="from">From system</label>
+        <input type="text" id="from" placeholder="e.g. Sol" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label for="to">To system</label>
+        <input type="text" id="to" placeholder="e.g. Wolf 359" autocomplete="off" spellcheck="false" />
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label for="range">Jump range (ly)</label>
+          <input type="number" id="range" value="30" min="5" max="100" step="0.1" />
+        </div>
+        <div class="field">
+          <label for="detour" title="How far off the route to search, measured in jumps">Detour jumps</label>
+          <input type="number" id="detour" value="1" min="1" max="5" step="1" />
+        </div>
+      </div>
+
+      <label class="check neutron-row" title="Departing a neutron star boosts jump range ~4x">
+        <input type="checkbox" id="neutron" />
+        <span>Neutron boost <span class="hint">(4&times;)</span></span>
+      </label>
+
+      <button id="calc">Calculate route</button>
+      <button id="spansh" title="Open the authoritative neutron route on spansh.co.uk">Open in Spansh &#8599;</button>
+
+      <div class="progress" id="progress"><div></div></div>
+      <div id="status">Enter two systems and calculate.</div>
+      <div id="uncharted"></div>
+    </div>
+
+    <!-- Legend -->
+    <div id="legend">
+      <h2>Legend</h2>
+      <div class="legend-grid">
+        <div class="legend-item"><span class="swatch" style="background:#fff2a1"></span> G / K (scoopable)</div>
+        <div class="legend-item"><span class="swatch" style="background:#aabfff"></span> O / B / A</div>
+        <div class="legend-item"><span class="swatch" style="background:#fff4e8"></span> F (scoopable)</div>
+        <div class="legend-item"><span class="swatch" style="background:#ff5a3c"></span> M (scoopable)</div>
+        <div class="legend-item"><span class="swatch" style="background:#7ffcff"></span> Neutron (non-scoop)</div>
+        <div class="legend-item"><span class="swatch" style="background:#dfefff"></span> White dwarf (non-scoop)</div>
+        <div class="legend-item"><span class="swatch" style="background:#7a4a2b"></span> Brown dwarf (non-scoop)</div>
+        <div class="legend-item"><span class="swatch" style="background:#2b2b2b"></span> Black hole (non-scoop)</div>
+      </div>
+      <div class="legend-grid" style="margin-top:8px">
+        <div class="legend-item"><span class="dot-solid"></span> Explored (has scan data)</div>
+        <div class="legend-item"><span class="dot-hollow"></span> Likely untouched</div>
+      </div>
+      <div class="legend-note">
+        Scoopable = <b>KGBFOAM</b>. Line = route. Corridor = every EDSM system within one jump of the route.
+        "Untouched" is a proxy (no scan data in EDSM) &mdash; confirm in-game with the Discovery Scanner.
+      </div>
+    </div>
+
+    <!-- Info panel -->
+    <div id="info">
+      <span class="close" id="info-close">&times;</span>
+      <h2 id="info-name">&mdash;</h2>
+      <div class="type" id="info-type"></div>
+      <dl>
+        <dt>Scoopable</dt><dd id="info-scoop"></dd>
+        <dt>Explored</dt><dd id="info-explored"></dd>
+        <dt>Bodies (EDSM)</dt><dd id="info-bodies"></dd>
+        <dt>Dist. from start</dt><dd id="info-dist"></dd>
+        <dt>Coords</dt><dd id="info-coords"></dd>
+      </dl>
+      <button id="verify">Verify discovery status</button>
+      <div id="discovery"></div>
+    </div>
+  </div>
+
+  <!-- App logic is inlined (not a separate .js file) so the page runs from a
+       double-clicked file:// URL — Chrome/Edge block external ES modules over file://. -->
+  <script type="module">
+// Elite Dangerous Route Explorer
+// Zero-install, client-side. Data: EDSM (CORS-open). 3D: three.js.
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+// ============================================================
+//  Config
+// ============================================================
+const EDSM = 'https://www.edsm.net';
+const SPHERE_MAX = 100;         // EDSM sphere-systems max radius (ly)
+const MAX_EXPANSIONS = 220;     // A* budget (each expansion = 1 EDSM call)
+const MAX_RENDER = 15000;       // safety cap on rendered systems (wide detour nets get large)
+const CONCURRENCY = 5;
+const HEURISTIC_WEIGHT = 1.6;   // >1 = greedier toward goal: fewer API calls, near-optimal routes
+
+// Scoopable classes: K G B F O A M
+const SCOOPABLE = new Set(['O', 'B', 'A', 'F', 'G', 'K', 'M']);
+
+// class -> display colour (approx real star colour)
+const STAR_COLORS = {
+  O: 0x9bb0ff, B: 0xaabfff, A: 0xcad7ff, F: 0xfff4e8,
+  G: 0xfff2a1, K: 0xffb347, M: 0xff5a3c,
+  NS: 0x7ffcff,   // neutron
+  WD: 0xdfefff,   // white dwarf (D)
+  BH: 0x2b2b2b,   // black hole
+  BD: 0x7a4a2b,   // brown dwarf (T/Y/L)
+  W:  0xd7e6ff,   // Wolf-Rayet
+  UNK: 0x8892a6
+};
+
+// ============================================================
+//  EDSM client  (throttled + cached)
+// ============================================================
+const sysCache = new Map();    // id64 / name -> system object
+const bodiesCache = new Map(); // name(lower) -> bodies response (reused by Verify)
+const trafficCache = new Map(); // 'traffic:'+name(lower) -> traffic response
+let inFlight = 0;
+const queue = [];
+
+function schedule() {
+  while (inFlight < CONCURRENCY && queue.length) {
+    const job = queue.shift();
+    inFlight++;
+    job().finally(() => { inFlight--; schedule(); });
+  }
+}
+function edsmGet(path, params) {
+  const url = new URL(EDSM + path);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  return new Promise((resolve, reject) => {
+    queue.push(() => fetch(url)
+      .then(async (r) => {
+        if (r.status === 429) { await sleep(1500); throw new Error('rate-limited'); }
+        if (!r.ok) throw new Error('EDSM ' + r.status);
+        return r.json();
+      })
+      .then(resolve, reject));
+    schedule();
+  });
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function resolveSystem(name) {
+  const key = 'name:' + name.toLowerCase();
+  if (sysCache.has(key)) return sysCache.get(key);
+  const d = await edsmGet('/api-v1/system', {
+    systemName: name, showCoordinates: 1, showId: 1, showPrimaryStar: 1
+  });
+  if (!d || !d.name || !d.coords) return null;
+  const sys = normalize(d);
+  // /api-v1/system omits bodyCount, so endpoints would wrongly read "untouched".
+  // Pull the real count from the bodies endpoint (and cache it for Verify).
+  try {
+    const b = await fetchBodies(sys.name);
+    if (b && typeof b.bodyCount === 'number') sys.bodyCount = b.bodyCount;
+  } catch { /* leave as-is */ }
+  sysCache.set(key, sys);
+  if (sys.id64 != null) sysCache.set(sys.id64, sys);
+  return sys;
+}
+
+async function sphereByCoords(x, y, z, radius) {
+  const d = await edsmGet('/api-v1/sphere-systems', {
+    x, y, z, radius: Math.min(radius, SPHERE_MAX),
+    showCoordinates: 1, showPrimaryStar: 1, showId: 1, showPermit: 1
+  });
+  // Screen out systems that don't belong on an exploration map:
+  //  - phantom/legacy EDSM entries (no id64, e.g. "Manu" duplicating Dromi's coords)
+  //  - no coordinates
+  //  - permit-locked systems (e.g. Pilots' Federation newbie district, Sol): veterans
+  //    can't visit/upload, so they falsely read as "uncharted".
+  return (d || []).map(normalize)
+    .filter((s) => s.id64 != null && s.coords && !s.requirePermit);
+}
+async function sphereByName(name, radius) {
+  const d = await edsmGet('/api-v1/sphere-systems', {
+    systemName: name, radius: Math.min(radius, SPHERE_MAX),
+    showCoordinates: 1, showPrimaryStar: 1, showId: 1, showPermit: 1
+  });
+  // Screen out systems that don't belong on an exploration map:
+  //  - phantom/legacy EDSM entries (no id64, e.g. "Manu" duplicating Dromi's coords)
+  //  - no coordinates
+  //  - permit-locked systems (e.g. Pilots' Federation newbie district, Sol): veterans
+  //    can't visit/upload, so they falsely read as "uncharted".
+  return (d || []).map(normalize)
+    .filter((s) => s.id64 != null && s.coords && !s.requirePermit);
+}
+async function fetchBodies(name) {
+  const k = name.toLowerCase();
+  if (bodiesCache.has(k)) return bodiesCache.get(k);
+  const d = await edsmGet('/api-system-v1/bodies', { systemName: name });
+  bodiesCache.set(k, d);
+  return d;
+}
+async function fetchTraffic(name) {
+  const k = 'traffic:' + name.toLowerCase();
+  if (trafficCache.has(k)) return trafficCache.get(k);
+  const d = await edsmGet('/api-system-v1/traffic', { systemName: name });
+  trafficCache.set(k, d);
+  return d;
+}
+async function autocomplete(q) {
+  try {
+    const d = await edsmGet('/api-v1/systems', { systemName: q });
+    return (d || []).map((s) => s.name).slice(0, 8);
+  } catch { return []; }
+}
+
+// Normalize an EDSM system record into our shape.
+function normalize(d) {
+  const type = d.primaryStar ? d.primaryStar.type : null;
+  return {
+    id64: d.id64,
+    // Unique map key: EDSM system names are unique and always present, whereas
+    // id64 can be null (e.g. Manu) or exceed JS safe-integer range (deep space).
+    key: (d.name || '').toLowerCase(),
+    name: d.name,
+    coords: d.coords,                       // {x,y,z}
+    type,
+    cls: starClass(type),
+    // EDSM gives isScoopable; fall back to class membership.
+    scoopable: d.primaryStar
+      ? !!d.primaryStar.isScoopable
+      : SCOOPABLE.has(starClass(type)),
+    bodyCount: (typeof d.bodyCount === 'number') ? d.bodyCount : 0,
+    requirePermit: !!d.requirePermit,       // permit-locked (screened from the map)
+    dist: d.distance                        // present on sphere results
+  };
+}
+
+// ============================================================
+//  Star helpers
+// ============================================================
+function starClass(type) {
+  if (!type) return 'UNK';
+  if (/neutron/i.test(type)) return 'NS';
+  if (/black hole/i.test(type)) return 'BH';
+  if (/white dwarf/i.test(type)) return 'WD';
+  if (/wolf-rayet/i.test(type)) return 'W';
+  if (/\b[TYL]\b|brown dwarf/i.test(type)) return 'BD';
+  const m = type.match(/^([OBAFGKM])\b/);
+  if (m) return m[1];
+  const first = type.trim()[0];
+  return /[OBAFGKM]/.test(first) ? first : 'UNK';
+}
+function starColor(sys) { return STAR_COLORS[sys.cls] || STAR_COLORS.UNK; }
+function isNeutron(sys) { return sys.cls === 'NS'; }
+const dist3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+
+// Add a system to a map, or upgrade its bodyCount if a better value arrives
+// (endpoints get an accurate count at resolve time; sphere results only upgrade).
+function mergeSystem(map, s) {
+  const ex = map.get(s.key);
+  if (!ex) { map.set(s.key, s); return; }
+  if ((s.bodyCount || 0) > (ex.bodyCount || 0)) ex.bodyCount = s.bodyCount;
+}
+// weekly-traffic bucket label
+function trafficLabel(week) {
+  if (!week) return 'untravelled';
+  if (week < 25) return 'lightly travelled';
+  return 'well travelled';
+}
+
+// ============================================================
+//  Router — A* over EDSM-known systems
+// ============================================================
+let cancelRequested = false;
+
+async function findRoute(from, to, range, neutron, onProgress) {
+  const all = new Map();                 // id64 -> sys  (everything seen = corridor)
+  const register = (s) => mergeSystem(all, s);
+  register(from); register(to);
+
+  const g = new Map([[from.key, 0]]);
+  const cameFrom = new Map();
+  const open = [{ sys: from, f: HEURISTIC_WEIGHT * dist3(from.coords, to.coords) }];
+  const closed = new Set();
+  let expansions = 0;
+
+  const effRange = (s) => (neutron && isNeutron(s)) ? Math.min(range * 4, SPHERE_MAX) : range;
+
+  while (open.length) {
+    if (cancelRequested) return { cancelled: true, all };
+    // pop lowest f
+    let bi = 0;
+    for (let i = 1; i < open.length; i++) if (open[i].f < open[bi].f) bi = i;
+    const { sys: current } = open.splice(bi, 1)[0];
+    if (closed.has(current.key)) continue;
+    closed.add(current.key);
+
+    // Goal reachable directly from here?
+    if (dist3(current.coords, to.coords) <= effRange(current)) {
+      cameFrom.set(to.key, current.key);
+      g.set(to.key, (g.get(current.key) || 0) + dist3(current.coords, to.coords));
+      return { route: rebuild(cameFrom, all, from, to), all, expansions };
+    }
+
+    if (expansions >= MAX_EXPANSIONS) {
+      return { budget: true, all };      // caller falls back to corridor
+    }
+    expansions++;
+    onProgress({ expansions, seen: all.size, best: dist3(current.coords, to.coords) });
+
+    let neighbors;
+    try { neighbors = await sphereByName(current.name, effRange(current)); }
+    catch { continue; }
+
+    for (const nb of neighbors) {
+      if (!nb.coords) continue;
+      register(nb);
+      if (closed.has(nb.key)) continue;
+      const step = (typeof nb.dist === 'number') ? nb.dist : dist3(current.coords, nb.coords);
+      const tentative = (g.get(current.key) || 0) + step;
+      if (tentative < (g.get(nb.key) ?? Infinity)) {
+        cameFrom.set(nb.key, current.key);
+        g.set(nb.key, tentative);
+        open.push({ sys: nb, f: tentative + HEURISTIC_WEIGHT * dist3(nb.coords, to.coords) });
+      }
+    }
+  }
+  return { noPath: true, all };
+}
+
+function rebuild(cameFrom, all, from, to) {
+  const path = [];
+  let cur = to.key;
+  const guard = new Set();
+  while (cur !== undefined && !guard.has(cur)) {
+    guard.add(cur);
+    const s = all.get(cur) || (cur === to.key ? to : cur === from.key ? from : null);
+    if (s) path.unshift(s);
+    cur = cameFrom.get(cur);
+  }
+  return path;
+}
+
+// Straight-line corridor fallback: sample the FROM->TO line, sphere each point.
+async function corridorFallback(from, to, range, detour, onProgress) {
+  const all = new Map();
+  const register = (s) => mergeSystem(all, s);
+  register(from); register(to);
+  const radius = Math.min(range * detour, SPHERE_MAX);
+  const total = dist3(from.coords, to.coords);
+  const step = Math.max(range * 1.4, 10);
+  const n = Math.min(Math.ceil(total / step), MAX_EXPANSIONS);
+  for (let i = 0; i <= n; i++) {
+    if (cancelRequested) return { cancelled: true, all };
+    const t = n === 0 ? 0 : i / n;
+    const x = from.coords.x + (to.coords.x - from.coords.x) * t;
+    const y = from.coords.y + (to.coords.y - from.coords.y) * t;
+    const z = from.coords.z + (to.coords.z - from.coords.z) * t;
+    try {
+      const found = await sphereByCoords(x, y, z, radius);
+      found.forEach(register);
+    } catch { /* skip point */ }
+    onProgress({ expansions: i, seen: all.size, best: total * (1 - t) });
+  }
+  return { corridor: true, all };
+}
+
+// ============================================================
+//  3D scene
+// ============================================================
+const container = document.getElementById('scene');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+container.appendChild(renderer.domElement);
+
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(window.innerWidth, window.innerHeight);
+labelRenderer.domElement.style.position = 'absolute';
+labelRenderer.domElement.style.top = '0';
+labelRenderer.domElement.style.pointerEvents = 'none';
+container.appendChild(labelRenderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x05070d);
+scene.fog = new THREE.FogExp2(0x05070d, 0.0009);
+
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 500000);
+camera.position.set(60, 60, 120);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+
+// starfield backdrop
+(function backdrop() {
+  const g = new THREE.BufferGeometry();
+  const N = 1500, pos = new Float32Array(N * 3);
+  // deterministic scatter (no Math.random dependency issues)
+  for (let i = 0; i < N; i++) {
+    const a = i * 2.399963;               // golden angle
+    const r = 8000 + (i % 500) * 20;
+    pos[i*3]   = Math.cos(a) * r;
+    pos[i*3+1] = (((i * 37) % 1000) - 500) * 12;
+    pos[i*3+2] = Math.sin(a) * r;
+  }
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x35507a, size: 6, sizeAttenuation: true })));
+})();
+
+// dynamic groups
+let systemsGroup = new THREE.Group();
+let routeGroup = new THREE.Group();
+let gridHelper = null;
+scene.add(systemsGroup, routeGroup);
+
+// Low-poly icosphere: uniform faceting + sparse wireframe so hollow (unexplored)
+// stars read clearly from a distance. detail 1 = 80 faces; drop to 0 for chunkier.
+const sphereGeo = new THREE.IcosahedronGeometry(1, 1);
+const pickables = [];
+let sceneCenter = new THREE.Vector3();
+let sceneExtent = 1;               // bounding radius of current draw (for camera focus)
+let meshBySys = new Map();         // id64 -> mesh (for list-click -> select)
+let unchartedEntries = [];         // [{sys, mesh, week?}] backing the uncharted list
+let lastFromForList = null;        // FROM system, for distance labels after traffic re-sort
+
+function clearScene() {
+  // Remove CSS2D label DOM elements FIRST, while they're still in the graph —
+  // clearing the groups detaches them and would orphan their <div>s on screen.
+  const labels = [];
+  scene.traverse((o) => { if (o.isCSS2DObject) labels.push(o); });
+  labels.forEach((o) => {
+    if (o.element && o.element.parentNode) o.element.parentNode.removeChild(o.element);
+    o.removeFromParent();
+  });
+  selectedLabel = null;
+  [systemsGroup, routeGroup].forEach((grp) => {
+    grp.traverse((o) => {
+      if (o.geometry && o.geometry !== sphereGeo) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    });
+    grp.clear();
+  });
+  if (gridHelper) { scene.remove(gridHelper); gridHelper = null; }
+  pickables.length = 0;
+}
+
+function makeLabel(text, cls) {
+  const div = document.createElement('div');
+  div.className = 'map-label ' + cls;
+  div.textContent = text;
+  return new CSS2DObject(div);
+}
+
+function drawResult(result, from, to, routeSystems) {
+  clearScene();
+  meshBySys = new Map();
+  // Render priority so the cap never drops what matters: endpoints first, then
+  // uncharted stars (the whole point of the search), then the general population.
+  const prio = (s) => (s.key === from.key || s.key === to.key) ? 0
+    : ((s.bodyCount || 0) === 0 ? 1 : 2);
+  const systems = [...result.all.values()].sort((a, b) => prio(a) - prio(b)).slice(0, MAX_RENDER);
+
+  // center on centroid, compute extent
+  const c = new THREE.Vector3();
+  systems.forEach((s) => c.add(new THREE.Vector3(s.coords.x, s.coords.y, s.coords.z)));
+  c.multiplyScalar(1 / Math.max(systems.length, 1));
+  sceneCenter.copy(c);
+  let extent = 1;
+  systems.forEach((s) => {
+    extent = Math.max(extent, Math.hypot(s.coords.x - c.x, s.coords.y - c.y, s.coords.z - c.z));
+  });
+
+  const markerR = Math.max(extent * 0.006, 0.35);
+
+  for (const s of systems) {
+    const isEnd = (s.key === from.key || s.key === to.key);
+    const explored = s.bodyCount > 0;
+    const mat = new THREE.MeshBasicMaterial({
+      color: starColor(s),
+      wireframe: !explored,
+      transparent: !explored,
+      opacity: explored ? 1 : 0.9
+    });
+    const m = new THREE.Mesh(sphereGeo, mat);
+    m.position.set(s.coords.x - c.x, s.coords.y - c.y, s.coords.z - c.z);
+    m.scale.setScalar(isEnd ? markerR * 2.4 : markerR);
+    m.userData.sys = s;
+    m.userData.from = from;
+    m.userData.isEnd = isEnd;
+    systemsGroup.add(m);
+    pickables.push(m);
+    meshBySys.set(s.key, m);
+
+    if (s.key === from.key) m.add(offsetLabel(makeLabel(from.name, 'from'), markerR));
+    if (s.key === to.key)   m.add(offsetLabel(makeLabel(to.name, 'to'), markerR));
+  }
+
+  // route line
+  if (routeSystems && routeSystems.length > 1) {
+    const pts = routeSystems.map((s) => new THREE.Vector3(s.coords.x - c.x, s.coords.y - c.y, s.coords.z - c.z));
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0x35e0ff }));
+    routeGroup.add(line);
+  } else if (result.corridor) {
+    // dashed straight line to signal "not a jump path"
+    const pts = [from, to].map((s) => new THREE.Vector3(s.coords.x - c.x, s.coords.y - c.y, s.coords.z - c.z));
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    const line = new THREE.Line(geo, new THREE.LineDashedMaterial({ color: 0x35e0ff, dashSize: extent*0.03, gapSize: extent*0.02 }));
+    line.computeLineDistances();
+    routeGroup.add(line);
+  }
+
+  // reference grid on galactic plane (y = 0 plane in ED coords -> our shifted -c.y)
+  const gsize = extent * 2.2;
+  gridHelper = new THREE.GridHelper(gsize, 20, 0x1c3050, 0x14243c);
+  gridHelper.position.y = -c.y;
+  scene.add(gridHelper);
+
+  // frame the camera
+  sceneExtent = extent;
+  controls.target.set(0, 0, 0);
+  const d = extent * 2.1 + 5;
+  camera.position.set(d * 0.6, d * 0.5, d);
+  camera.near = Math.max(d / 5000, 0.05);
+  camera.far = d * 50;
+  camera.updateProjectionMatrix();
+  controls.update();
+
+  renderUncharted(systems, from);
+  return systems.filter((s) => (s.bodyCount || 0) === 0).length;
+}
+
+function offsetLabel(lbl, r) { lbl.position.set(0, r, 0); return lbl; }
+
+// ============================================================
+//  Picking / info panel
+// ============================================================
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let selected = null;
+let selectedLabel = null;   // CSS2D flag on the currently-clicked star
+
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.params.Points = { threshold: 1 };
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(pickables, false);
+  if (hits.length) selectStar(hits[0].object);
+});
+
+// Flag the clicked star (removing any previous flag first). Endpoints already
+// carry their FROM/TO flags, so we don't double-label them.
+function selectStar(mesh) {
+  clearSelection();
+  const s = mesh.userData.sys;
+  if (!mesh.userData.isEnd) {
+    selectedLabel = makeLabel(s.name, 'selected');
+    selectedLabel.position.set(0, 1.4, 0);   // just above the unit-sphere geometry
+    mesh.add(selectedLabel);
+  }
+  showInfo(s, mesh.userData.from);
+  // keep the uncharted list in sync with the 3D selection (no camera move — the
+  // flag alone marks the star, so you can compare positions to plan a route)
+  document.querySelectorAll('.uc-item.active').forEach((e) => e.classList.remove('active'));
+  const idx = unchartedEntries.findIndex((e) => e.mesh === mesh);
+  if (idx >= 0) {
+    const el = document.querySelector('.uc-item[data-idx="' + idx + '"]');
+    if (el) { el.classList.add('active'); el.scrollIntoView({ block: 'nearest' }); }
+  }
+}
+function clearSelection() {
+  if (selectedLabel) {
+    if (selectedLabel.element && selectedLabel.element.parentNode)
+      selectedLabel.element.parentNode.removeChild(selectedLabel.element);
+    selectedLabel.removeFromParent();
+    selectedLabel = null;
+  }
+}
+// Build the clickable uncharted-stars list (systems EDSM has no scan data for).
+function renderUncharted(systems, from) {
+  lastFromForList = from;
+  const uc = systems.filter((s) => (s.bodyCount || 0) === 0);
+  uc.sort((a, b) => dist3(a.coords, from.coords) - dist3(b.coords, from.coords));
+  unchartedEntries = uc.map((s) => ({ sys: s, mesh: meshBySys.get(s.key), week: undefined }));
+  paintUncharted(false);
+}
+// (re)render the list DOM. trafficDone => show weekly traffic + dim trampled ones.
+function paintUncharted(trafficDone) {
+  const box = $('uncharted');
+  if (!unchartedEntries.length) {
+    box.innerHTML = '<div class="uncharted-head">Uncharted stars (0)</div>'
+      + '<div class="footfall-note">Every star in view has EDSM scan data. Raise &ldquo;Detour jumps&rdquo; to cast a wider net.</div>';
+    return;
+  }
+  const items = unchartedEntries.map((e, i) => {
+    const s = e.sys;
+    const d = dist3(s.coords, lastFromForList.coords).toFixed(1);
+    const hex = '#' + starColor(s).toString(16).padStart(6, '0');
+    const trampled = (typeof e.week === 'number' && e.week > 0);
+    let wk = '';
+    if (typeof e.week === 'number') wk = ' &middot; ' + e.week + '/wk';
+    else if (e.week === null) wk = ' &middot; traffic n/a';
+    return '<div class="uc-item' + (trampled ? ' trampled' : '') + '" data-idx="' + i + '">'
+      + '<span class="uc-dot" style="background:' + hex + '"></span>'
+      + '<span class="uc-name">' + escapeHtml(s.name) + '</span>'
+      + '<span class="uc-meta">' + s.cls + ' &middot; ' + d + ' ly' + wk + '</span>'
+      + '</div>';
+  }).join('');
+  const ctrl = trafficDone
+    ? '<span class="uc-btn done">traffic checked</span>'
+    : '<button class="uc-btn" id="uc-traffic-btn">Check traffic</button>';
+  box.innerHTML = '<div class="uncharted-head"><span>Uncharted stars (' + unchartedEntries.length + ')</span>' + ctrl + '</div>'
+    + '<div class="uncharted-list">' + items + '</div>';
+}
+// One traffic call per listed system (gated behind the button). Dims trampled
+// systems (nonzero weekly traffic) and re-sorts untravelled/quietest first.
+async function checkUnchartedTraffic() {
+  const btn = document.getElementById('uc-traffic-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+  await Promise.all(unchartedEntries.map(async (e) => {
+    try {
+      const t = await fetchTraffic(e.sys.name);
+      e.week = (t && t.traffic && typeof t.traffic.week === 'number') ? t.traffic.week : 0;
+    } catch { e.week = null; }
+  }));
+  unchartedEntries.sort((a, b) => (a.week || 0) - (b.week || 0)
+    || dist3(a.sys.coords, lastFromForList.coords) - dist3(b.sys.coords, lastFromForList.coords));
+  paintUncharted(true);
+}
+// clicks inside the uncharted box: the traffic button, or a star row
+document.getElementById('uncharted').addEventListener('click', (e) => {
+  if (e.target.closest('#uc-traffic-btn')) { checkUnchartedTraffic(); return; }
+  const item = e.target.closest('.uc-item');
+  if (!item) return;
+  const entry = unchartedEntries[Number(item.dataset.idx)];
+  if (entry && entry.mesh) selectStar(entry.mesh);
+});
+
+const $ = (id) => document.getElementById(id);
+function showInfo(s, from) {
+  selected = s;
+  $('info').classList.add('on');
+  $('info-name').textContent = s.name;
+  $('info-type').textContent = s.type || 'Unknown primary star';
+  $('info-scoop').innerHTML = s.scoopable
+    ? '<span class="badge yes">Yes</span>' : '<span class="badge no">No</span>';
+  const explored = s.bodyCount > 0;
+  $('info-explored').innerHTML = explored
+    ? '<span class="badge yes">Scan data</span>' : '<span class="badge no">Untouched?</span>';
+  $('info-bodies').textContent = s.bodyCount;
+  $('info-dist').textContent = from ? dist3(s.coords, from.coords).toFixed(2) + ' ly' : '—';
+  $('info-coords').textContent = `${s.coords.x.toFixed(1)}, ${s.coords.y.toFixed(1)}, ${s.coords.z.toFixed(1)}`;
+  $('discovery').textContent = '';
+  $('verify').disabled = false;
+  $('verify').textContent = 'Verify discovery status';
+}
+$('info-close').addEventListener('click', () => { $('info').classList.remove('on'); clearSelection(); });
+$('verify').addEventListener('click', async () => {
+  if (!selected) return;
+  $('verify').disabled = true; $('verify').textContent = 'Checking EDSM…';
+  try {
+    const [d, t] = await Promise.all([
+      fetchBodies(selected.name),
+      fetchTraffic(selected.name).catch(() => null)
+    ]);
+    const bodies = d.bodies || [];
+    const known = d.bodyCount || 0;
+    const scanned = bodies.length;
+    const main = bodies.find((b) => b.isMainStar) || bodies[0];
+    // Verify has richer data than the bulk query — reflect the real count.
+    $('info-bodies').textContent = Math.max(known, scanned);
+
+    let trafficLine;
+    if (t && t.traffic && typeof t.traffic.week === 'number') {
+      const wk = t.traffic.week, tot = t.traffic.total || 0;
+      trafficLine = `<div class="footfall-note"><b>Traffic:</b> ${wk} ship${wk === 1 ? '' : 's'} this week, `
+        + `${tot} total &mdash; ${trafficLabel(wk)}.</div>`;
+    } else {
+      trafficLine = `<div class="footfall-note"><b>Traffic:</b> no EDSM data.</div>`;
+    }
+
+    let head;
+    if (scanned === 0) {
+      head = `EDSM has no body scan data for this system.`;
+    } else if (known >= scanned) {
+      head = `EDSM knows <b>${scanned}</b> of <b>${known}</b> bodies.`;
+    } else {
+      // e.g. main star logged but the system's full FSS body count is unrecorded
+      head = `EDSM has records for <b>${scanned}</b> ${scanned === 1 ? 'body' : 'bodies'} (full count unrecorded).`;
+    }
+    if (main && main.discovery && main.discovery.commander) {
+      head += ` System first logged by <b>${escapeHtml(main.discovery.commander)}</b>`
+            + (main.discovery.date ? ` (${main.discovery.date.split(' ')[0]})` : '') + '.';
+    } else {
+      head += ' No first-discovery record on the main star — good exploration candidate.';
+    }
+
+    const rows = bodies.map((b) => {
+      const disc = (b.discovery && b.discovery.commander)
+        ? `<span class="disc">&#10004; ${escapeHtml(b.discovery.commander)}${b.discovery.date ? ' &middot; ' + b.discovery.date.split(' ')[0] : ''}</span>`
+        : `<span class="undisc">&#10008; no discovery record</span>`;
+      const land = b.isLandable ? '<span class="land">&#9660; landable</span>' : '';
+      return `<div class="body-row">`
+        + `<div class="bn">${escapeHtml(b.name)} ${land}</div>`
+        + `<div class="bt">${escapeHtml(b.subType || b.type || '')}</div>`
+        + `<div class="bd">${disc}</div>`
+        + `</div>`;
+    }).join('');
+
+    const list = scanned
+      ? `<div class="body-list">${rows}</div>`
+      : `<div class="footfall-note">No scanned bodies recorded in EDSM for this system.</div>`;
+
+    $('discovery').innerHTML = head + trafficLine
+      + `<div class="footfall-note">Footfall (first to set foot) isn't published by EDSM, so it can't be shown. `
+      + `&#10004;/&#10008; is first-<i>discovery</i>; &#9660; marks bodies you can actually land on.</div>`
+      + list;
+    $('verify').textContent = 'Verified';
+  } catch {
+    $('discovery').innerHTML = '<span style="color:var(--bad)">Lookup failed (system may be unknown to EDSM).</span>';
+    $('verify').disabled = false; $('verify').textContent = 'Retry';
+  }
+});
+function escapeHtml(s){return s.replace(/[&<>"]/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+// ============================================================
+//  Render loop / resize
+// ============================================================
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
+}
+animate();
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  labelRenderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============================================================
+//  UI wiring
+// ============================================================
+const statusEl = $('status');
+const progEl = $('progress');
+let running = false;
+
+function setStatus(html) { statusEl.innerHTML = html; }
+function setProgress(on, pct) {
+  progEl.classList.toggle('on', on);
+  if (on) progEl.firstElementChild.style.width = Math.min(pct, 100) + '%';
+}
+
+async function calculate() {
+  if (running) { cancelRequested = true; return; }
+  const fromName = $('from').value.trim();
+  const toName = $('to').value.trim();
+  const range = parseFloat($('range').value);
+  const neutron = $('neutron').checked;
+  const detour = Math.max(1, Math.min(5, parseInt($('detour').value, 10) || 1));
+  if (!fromName || !toName) { setStatus('<span class="msg-warn">Enter both a From and To system.</span>'); return; }
+  if (!(range >= 5)) { setStatus('<span class="msg-warn">Enter a valid jump range (≥ 5 ly).</span>'); return; }
+
+  running = true; cancelRequested = false;
+  const btn = $('calc'); btn.classList.add('cancel'); btn.textContent = 'Cancel';
+  setProgress(true, 5);
+  setStatus('Resolving systems…');
+  $('uncharted').innerHTML = '';
+
+  try {
+    const [from, to] = await Promise.all([resolveSystem(fromName), resolveSystem(toName)]);
+    if (!from) { fail(`"${fromName}" not found in EDSM.`); return; }
+    if (!to) { fail(`"${toName}" not found in EDSM.`); return; }
+
+    const straight = dist3(from.coords, to.coords);
+    setStatus(`<span class="stat">${from.name}</span> → <span class="stat">${to.name}</span> · ${straight.toFixed(1)} ly straight-line. Plotting…`);
+
+    const onProgress = ({ expansions, seen, best }) => {
+      const pct = Math.max(5, 100 * (1 - best / (straight || 1)));
+      setProgress(true, pct);
+      setStatus(`Plotting… ${expansions} hops explored · ${seen} systems mapped · ${best.toFixed(0)} ly to go`
+        + (cancelRequested ? ' · cancelling…' : ''));
+    };
+
+    let result = await findRoute(from, to, range, neutron, onProgress);
+    let routeSystems = null;
+    let note = '';
+
+    if (result.cancelled) { fail('Cancelled.'); return; }
+
+    if (result.route) {
+      routeSystems = result.route;
+      // populate the detour neighbourhood around each waypoint
+      setStatus('Route found — filling corridor…');
+      await fillCorridor(routeSystems, range, detour, result.all, onProgress);
+      const jumps = routeSystems.length - 1;
+      const pathLy = routeLength(routeSystems);
+      const rkm = Math.min(range * detour, SPHERE_MAX);
+      note = `<span class="msg-good">Route found:</span> <span class="stat">${jumps} jumps</span>, `
+           + `${pathLy.toFixed(1)} ly travelled · ${result.all.size} systems within `
+           + `${detour} jump${detour > 1 ? 's' : ''} (${rkm.toFixed(0)} ly) of the route.`;
+    } else {
+      // budget / noPath -> straight-line corridor fallback
+      setStatus('No jumpable path through EDSM coverage — mapping straight-line corridor…');
+      const fb = await corridorFallback(from, to, range, detour, onProgress);
+      if (fb.cancelled) { fail('Cancelled.'); return; }
+      // merge anything A* already found
+      result.all.forEach((v, k) => fb.all.set(k, v));
+      result = fb;
+      note = `<span class="msg-warn">No jump-by-jump route found in EDSM's data.</span> `
+           + `Showing the corridor of ${result.all.size} known systems along the straight line. `
+           + `Use “Open in Spansh” for the authoritative long-haul route.`;
+    }
+
+    const uncharted = drawResult(result, from, to, routeSystems);
+    const capNote = result.all.size > MAX_RENDER ? ` <span class="msg-warn">(rendering ${MAX_RENDER} of ${result.all.size}; uncharted prioritised)</span>` : '';
+    setStatus(note + `<br><span class="stat">${uncharted}</span> uncharted star${uncharted === 1 ? '' : 's'} in view`
+      + ` (no EDSM scan data)${uncharted ? ' — listed below' : ''}.` + capNote);
+  } catch (e) {
+    fail('Error: ' + (e.message || e));
+  } finally {
+    running = false;
+    const btn2 = $('calc'); btn2.classList.remove('cancel'); btn2.textContent = 'Calculate route';
+    setProgress(false, 0);
+  }
+}
+
+async function fillCorridor(routeSystems, range, detour, all, onProgress) {
+  const radius = Math.min(range * detour, SPHERE_MAX);
+  let i = 0;
+  for (const wp of routeSystems) {
+    if (cancelRequested) return;
+    try {
+      const found = await sphereByName(wp.name, radius);
+      found.forEach((s) => mergeSystem(all, s));
+    } catch { /* ignore */ }
+    onProgress({ expansions: ++i, seen: all.size, best: 0 });
+  }
+}
+function routeLength(rs) { let d = 0; for (let i = 1; i < rs.length; i++) d += dist3(rs[i-1].coords, rs[i].coords); return d; }
+function fail(msg) { setStatus('<span class="msg-bad">' + msg + '</span>'); }
+
+$('calc').addEventListener('click', calculate);
+$('range').addEventListener('keydown', (e) => { if (e.key === 'Enter') calculate(); });
+$('to').addEventListener('keydown', (e) => { if (e.key === 'Enter') calculate(); });
+
+// Open in Spansh (authoritative neutron route)
+$('spansh').addEventListener('click', () => {
+  const from = $('from').value.trim(), to = $('to').value.trim(), range = $('range').value;
+  if (!from || !to) { setStatus('<span class="msg-warn">Enter both systems first.</span>'); return; }
+  const u = new URL('https://spansh.co.uk/');
+  u.searchParams.set('from', from); u.searchParams.set('to', to);
+  u.searchParams.set('range', range); u.searchParams.set('efficiency', '60');
+  window.open(u.toString(), '_blank', 'noopener');
+});
+
+// ---- autocomplete (best-effort) ----
+function wireAutocomplete(inputId) {
+  const input = $(inputId);
+  let box = null, timer = null, active = -1, items = [];
+  const close = () => { if (box) { box.remove(); box = null; active = -1; } };
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 2) { close(); return; }
+    timer = setTimeout(async () => {
+      items = await autocomplete(q);
+      close();
+      if (!items.length) return;
+      box = document.createElement('div');
+      box.className = 'autocomplete';
+      items.forEach((name, idx) => {
+        const d = document.createElement('div');
+        d.textContent = name;
+        d.addEventListener('mousedown', (e) => { e.preventDefault(); input.value = name; close(); });
+        box.appendChild(d);
+      });
+      input.parentElement.appendChild(box);
+    }, 220);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (!box) return;
+    const opts = [...box.children];
+    if (e.key === 'ArrowDown') { active = (active + 1) % opts.length; }
+    else if (e.key === 'ArrowUp') { active = (active - 1 + opts.length) % opts.length; }
+    else if (e.key === 'Enter' && active >= 0) { input.value = items[active]; close(); e.preventDefault(); return; }
+    else if (e.key === 'Escape') { close(); return; }
+    else return;
+    opts.forEach((o, i) => o.classList.toggle('active', i === active));
+    e.preventDefault();
+  });
+  input.addEventListener('blur', () => setTimeout(close, 150));
+}
+wireAutocomplete('from');
+wireAutocomplete('to');
+
+setStatus('Ready. Try <span class="stat">Sol</span> → <span class="stat">Wolf 359</span> at 30 ly.');
+  </script>
+</body>
+</html>
